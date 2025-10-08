@@ -103,6 +103,25 @@ def handle_client(ws: Any) -> None:
         logging.info(f"Client disconnected. Active clients={num}")
 
 
+def process_request(path: str, request_headers: Dict[str, str]):
+    """
+    Handle non-WebSocket HTTP requests for platform health checks.
+
+    Render and similar platforms often send HEAD/GET to the root path.
+    We return 200 OK for non-upgrade requests so health checks pass.
+    Returning None allows WebSocket handshake to proceed for real clients.
+    """
+    upgrade = request_headers.get("Upgrade", "").lower()
+    if upgrade != "websocket":
+        body = b"OK"
+        return (
+            200,
+            [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
+            body,
+        )
+    return None
+
+
 def broadcast(message: str, exclude: Any | None = None) -> None:
     """Send a message to all connected clients except the optional exclude."""
     targets = [c for c in clients.snapshot() if c is not exclude]
@@ -123,7 +142,15 @@ def safe_send(ws: Any, message: str) -> None:
 def main() -> None:
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8765"))
-    with serve(handle_client, host, port, ping_interval=20, ping_timeout=20, max_size=2**20) as server:
+    with serve(
+        handle_client,
+        host,
+        port,
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=2**20,
+        process_request=process_request,
+    ) as server:
         logging.info(f"WebSocket server started at ws://{host}:{port}")
         server.serve_forever()
 
