@@ -112,10 +112,19 @@ def process_request(path: str, request_headers: Dict[str, str]):
     Returning None allows WebSocket handshake to proceed for real clients.
     """
     upgrade = request_headers.get("Upgrade", "").lower()
+    # Health checks (HEAD/GET) → 200 OK
     if upgrade != "websocket":
         body = b"OK"
         return (
             200,
+            [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
+            body,
+        )
+    # Only allow WS upgrades on /ws to avoid collisions with health checks
+    if path != "/ws":
+        body = b"Not Found"
+        return (
+            404,
             [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
             body,
         )
