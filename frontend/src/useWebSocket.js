@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-const DEFAULT_URL = (import.meta.env.VITE_WS_URL) || 'ws://localhost:8765/ws'
+// Use /ws path to match backend upgrade route in production
+const DEFAULT_URL =  'wss://colab-pri.onrender.com/ws'
 
 export function useWebSocket(url = DEFAULT_URL) {
   const wsRef = useRef(null)
@@ -35,8 +36,10 @@ export function useWebSocket(url = DEFAULT_URL) {
       scheduleReconnect()
     }
 
-    ws.onerror = () => {
-      // Will trigger close in many cases
+    ws.onerror = (event) => {
+      // Surface browser-side error details in console to aid debugging
+      // eslint-disable-next-line no-console
+      console.error('WebSocket onerror:', { url, event })
     }
   }, [url])
 
