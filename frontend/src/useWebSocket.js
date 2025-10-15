@@ -9,12 +9,26 @@ export function useWebSocket(url = DEFAULT_URL) {
   const [lastMessage, setLastMessage] = useState(null)
   const reconnectRef = useRef({ attempts: 0, timer: null })
 
+  const normalizeWsUrl = useCallback((input) => {
+    if (!input) return input
+    // Ensure ws(s) scheme even if someone passes http(s)
+    if (input.startsWith('ws://') || input.startsWith('wss://')) return input
+    if (input.startsWith('http://')) return input.replace('http://', 'ws://')
+    if (input.startsWith('https://')) return input.replace('https://', 'wss://')
+    if (input.startsWith('/')) {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      return `${proto}//${window.location.host}${input}`
+    }
+    return input
+  }, [])
+
   const connect = useCallback(() => {
     if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
       return
     }
     setConnectionStatus('connecting')
-    const ws = new WebSocket(url)
+    const wsUrl = normalizeWsUrl(url)
+    const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
     ws.onopen = () => {
@@ -39,9 +53,9 @@ export function useWebSocket(url = DEFAULT_URL) {
     ws.onerror = (event) => {
       // Surface browser-side error details in console to aid debugging
       // eslint-disable-next-line no-console
-      console.error('WebSocket onerror:', { url, event })
+      console.error('WebSocket onerror:', { url: wsUrl, event })
     }
-  }, [url])
+  }, [url, normalizeWsUrl])
 
   const scheduleReconnect = useCallback(() => {
     const { attempts, timer } = reconnectRef.current
