@@ -13,6 +13,12 @@ export default function Editor({ wsApi }) {
   const debounceTimer = useRef(null)
   const lockRenewalTimer = useRef(null)
 
+  // Determine if the current user can edit
+  const canEdit = useMemo(() => {
+    if (!isLocked) return true
+    return hasLock && lockHolder === clientId
+  }, [isLocked, hasLock, lockHolder, clientId])
+
   useEffect(() => {
     if (!lastMessage) return
     if (lastMessage.type === 'init' || lastMessage.type === 'document') {
@@ -27,7 +33,7 @@ export default function Editor({ wsApi }) {
       setLockHolder(lastMessage.lock_holder || null)
       setSyncStatus('synced')
       if (clientId && lastMessage.lock_holder === clientId) {
-        setHasLock(True)
+        setHasLock(true)
       } else if (lastMessage.lock_holder !== clientId) {
         setHasLock(false)
       }
@@ -65,6 +71,13 @@ export default function Editor({ wsApi }) {
       }
     }
   }, [lastMessage, clientId, clients])
+
+  // Auto-request lock when the editor becomes unlocked
+  useEffect(() => {
+    if (connectionStatus === 'connected' && !isLocked && !hasLock) {
+      requestLock()
+    }
+  }, [connectionStatus, isLocked, hasLock])
 
   const startLockRenewal = () => {
     stopLockRenewal()
@@ -128,7 +141,7 @@ export default function Editor({ wsApi }) {
         value={content}
         onChange={onChange}
         onFocus={() => { if (!hasLock && !isLocked) requestLock() }}
-        onBlur={() => { setTimeout(() => { if (hasLock) releaseLock() }, 1000) }}
+        onBlur={() => { setTimeout(() => { if (hasLock) releaseLock() }, 500) }}
         disabled={!canEdit}
         style={{ width: '100%', minHeight: 300, fontFamily: 'monospace', fontSize: 14, padding: 12, opacity: canEdit ? 1 : 0.6, cursor: canEdit ? 'text' : 'not-allowed' }}
         placeholder={canEdit ? "Start typing..." : "Waiting for edit control..."}
