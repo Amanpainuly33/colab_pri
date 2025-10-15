@@ -3,63 +3,68 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import uuid
-from typing import Set, Dict, Any
+from typing import Dict, Any, List
 
-from websockets.sync.server import serve
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
 from document_store import DocumentStore
 
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(threadName)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
 
 class ClientRegistry:
-    """Thread-safe registry of connected clients with IDs."""
+    """Async-safe registry of connected clients with IDs."""
 
     def __init__(self) -> None:
-        self._clients: Dict[str, Any] = {}
-        self._lock = threading.Lock()
+        self._clients: Dict[str, WebSocket] = {}
 
-    def add(self, client_id: str, ws: Any) -> int:
-        with self._lock:
-            self._clients[client_id] = ws
-            return len(self._clients)
+    def add(self, client_id: str, ws: WebSocket) -> int:
+        self._clients[client_id] = ws
+        return len(self._clients)
 
     def remove(self, client_id: str) -> int:
-        with self._lock:
-            self._clients.pop(client_id, None)
-            return len(self._clients)
+        self._clients.pop(client_id, None)
+        return len(self._clients)
 
-    def snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            return dict(self._clients)
+    def snapshot(self) -> Dict[str, WebSocket]:
+        return dict(self._clients)
 
 
-document_store = DocumentStore()
+document_store = DocumentStore(lock_timeout=3.0)
 clients = ClientRegistry()
 
+app = FastAPI()
 
-def handle_client(ws: Any) -> None:
-    """
-    Per-connection handler running in its own thread.
 
-    OS Concepts:
-    - Thread-per-client model: Each WebSocket connection is handled by a dedicated thread.
-    - Mutual Exclusion: Document operations are protected in DocumentStore.
-    - Shared Resource: The document content and client set.
-    - Blocking I/O: This thread blocks on ws.send() and message iteration.
-    """
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse({"status": "ok"})
+
+
+async def broadcast(message: str, exclude: WebSocket | None = None) -> None:
+    snapshot = clients.snapshot()
+    targets: List[WebSocket] = [ws for ws in snapshot.values() if ws is not exclude]
+    for ws in targets:
+        try:
+            await ws.send_text(message)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket) -> None:
+    await ws.accept()
     client_id = str(uuid.uuid4())
     num = clients.add(client_id, ws)
     logging.info(f"Client {client_id} connected. Active clients={num}")
 
     try:
-        # On connect, send current document
-        content, version = document_store.get_document()
-        lock_holder, is_locked = document_store.get_lock_status()
-        ws.send(json.dumps({
+        content, version = await document_store.get_document()
+        lock_holder, is_locked = await document_store.get_lock_status()
+        await ws.send_text(json.dumps({
             "type": "init",
             "client_id": client_id,
             "content": content,
@@ -69,18 +74,19 @@ def handle_client(ws: Any) -> None:
             "is_locked": is_locked,
         }))
 
-        for raw in ws:
+        while True:
+            text = await ws.receive_text()
             try:
-                message: Dict[str, Any] = json.loads(raw)
+                message: Dict[str, Any] = json.loads(text)
             except json.JSONDecodeError:
-                ws.send(json.dumps({"type": "error", "message": "invalid_json"}))
+                await ws.send_text(json.dumps({"type": "error", "message": "invalid_json"}))
                 continue
 
             mtype = message.get("type")
             if mtype == "get_document":
-                content, version = document_store.get_document()
-                lock_holder, is_locked = document_store.get_lock_status()
-                ws.send(json.dumps({
+                content, version = await document_store.get_document()
+                lock_holder, is_locked = await document_store.get_lock_status()
+                await ws.send_text(json.dumps({
                     "type": "document",
                     "content": content,
                     "version": version,
@@ -89,33 +95,33 @@ def handle_client(ws: Any) -> None:
                     "is_locked": is_locked,
                 }))
             elif mtype == "request_lock":
-                acquired = document_store.try_acquire_editor_lock(client_id)
-                ws.send(json.dumps({
+                acquired = await document_store.try_acquire_editor_lock(client_id)
+                await ws.send_text(json.dumps({
                     "type": "lock_response",
                     "acquired": acquired,
                     "lock_holder": client_id if acquired else None,
                 }))
                 if acquired:
-                    broadcast(json.dumps({
+                    await broadcast(json.dumps({
                         "type": "lock_status",
                         "is_locked": True,
                         "lock_holder": client_id,
                     }), exclude=None)
             elif mtype == "release_lock":
-                document_store.release_editor_lock(client_id)
-                ws.send(json.dumps({"type": "lock_released"}))
-                broadcast(json.dumps({
+                await document_store.release_editor_lock(client_id)
+                await ws.send_text(json.dumps({"type": "lock_released"}))
+                await broadcast(json.dumps({
                     "type": "lock_status",
                     "is_locked": False,
                     "lock_holder": None,
                 }), exclude=None)
             elif mtype == "renew_lock":
-                renewed = document_store.renew_editor_lock(client_id)
-                ws.send(json.dumps({"type": "lock_renewed", "renewed": renewed}))
+                renewed = await document_store.renew_editor_lock(client_id)
+                await ws.send_text(json.dumps({"type": "lock_renewed", "renewed": renewed}))
             elif mtype == "edit":
-                lock_holder, is_locked = document_store.get_lock_status()
+                lock_holder, is_locked = await document_store.get_lock_status()
                 if is_locked and lock_holder != client_id:
-                    ws.send(json.dumps({
+                    await ws.send_text(json.dumps({
                         "type": "error",
                         "message": "edit_locked",
                         "lock_holder": lock_holder,
@@ -123,8 +129,8 @@ def handle_client(ws: Any) -> None:
                     continue
 
                 new_content = message.get("content", "")
-                updated_version = document_store.update_document(new_content)
-                ws.send(json.dumps({"type": "ack", "version": updated_version}))
+                updated_version = await document_store.update_document(new_content)
+                await ws.send_text(json.dumps({"type": "ack", "version": updated_version}))
                 broadcast_payload = json.dumps({
                     "type": "document",
                     "content": new_content,
@@ -133,16 +139,16 @@ def handle_client(ws: Any) -> None:
                     "lock_holder": lock_holder,
                     "is_locked": is_locked,
                 })
-                broadcast(broadcast_payload, exclude=ws)
+                await broadcast(broadcast_payload, exclude=ws)
             else:
-                ws.send(json.dumps({"type": "error", "message": "unknown_type"}))
-
-    except Exception as exc:  # noqa: BLE001 broad catch for server stability with logging
-        logging.exception("Unhandled error in client handler: %s", exc)
+                await ws.send_text(json.dumps({"type": "error", "message": "unknown_type"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logging.exception("Unhandled error in websocket handler: %s", exc)
     finally:
-        # Release any lock held by this client and notify others
-        document_store.release_editor_lock(client_id)
-        broadcast(json.dumps({
+        await document_store.release_editor_lock(client_id)
+        await broadcast(json.dumps({
             "type": "lock_status",
             "is_locked": False,
             "lock_holder": None,
@@ -151,72 +157,14 @@ def handle_client(ws: Any) -> None:
         logging.info(f"Client {client_id} disconnected. Active clients={num}")
 
 
-def process_request(path: str, request_headers: Dict[str, str]):
-    """
-    Handle non-WebSocket HTTP requests for platform health checks.
-
-    Render and similar platforms often send HEAD/GET to the root path.
-    We return 200 OK for non-upgrade requests so health checks pass.
-    Returning None allows WebSocket handshake to proceed for real clients.
-    """
-    upgrade = request_headers.get("Upgrade", "").lower()
-    # Health checks (HEAD/GET) → 200 OK
-    if upgrade != "websocket":
-        body = b"OK"
-        return (
-            200,
-            [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
-            body,
-        )
-    # Only allow WS upgrades on /ws to avoid collisions with health checks
-    if path != "/ws":
-        body = b"Not Found"
-        return (
-            404,
-            [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
-            body,
-        )
-    return None
-
-
-def broadcast(message: str, exclude: Any | None = None) -> None:
-    """Send a message to all connected clients except the optional exclude."""
-    snapshot = clients.snapshot()
-    targets = [ws for ws in snapshot.values() if ws is not exclude]
-    for ws in targets:
-        try:
-            ws.send(message)
-        except Exception:
-            pass
-
-
-def safe_send(ws: Any, message: str) -> None:
-    try:
-        ws.send(message)
-    except Exception:
-        logging.debug("Failed to send to a client; ignoring (likely disconnected)")
-
-
 def main() -> None:
+    import uvicorn
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8765"))
-    with serve(
-        handle_client,
-        host,
-        port,
-        ping_interval=20,
-        ping_timeout=20,
-        max_size=2**20,
-        process_request=process_request,
-    ) as server:
-        logging.info(f"WebSocket server started at ws://{host}:{port}")
-        server.serve_forever()
+    uvicorn.run("server:app", host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("Server shutdown requested by user")
+    main()
 
 
