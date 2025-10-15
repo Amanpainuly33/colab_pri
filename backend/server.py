@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from typing import Set, Dict, Any
 
 from websockets.sync.server import serve
@@ -15,25 +16,25 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(th
 
 
 class ClientRegistry:
-    """Thread-safe registry of connected clients."""
+    """Thread-safe registry of connected clients with IDs."""
 
     def __init__(self) -> None:
-        self._clients: Set[Any] = set()
+        self._clients: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
-    def add(self, ws: Any) -> int:
+    def add(self, client_id: str, ws: Any) -> int:
         with self._lock:
-            self._clients.add(ws)
+            self._clients[client_id] = ws
             return len(self._clients)
 
-    def remove(self, ws: Any) -> int:
+    def remove(self, client_id: str) -> int:
         with self._lock:
-            self._clients.discard(ws)
+            self._clients.pop(client_id, None)
             return len(self._clients)
 
-    def snapshot(self) -> Set[Any]:
+    def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            return set(self._clients)
+            return dict(self._clients)
 
 
 document_store = DocumentStore()
@@ -42,25 +43,30 @@ clients = ClientRegistry()
 
 def handle_client(ws: Any) -> None:
     """
-    Per-connection handler.
+    Per-connection handler running in its own thread.
 
     OS Concepts:
-    - Multi-threading model: We keep single asyncio loop but emulate thread-per-client via tasks.
-      In classic OS terms, each client is handled concurrently; critical sections are guarded.
+    - Thread-per-client model: Each WebSocket connection is handled by a dedicated thread.
     - Mutual Exclusion: Document operations are protected in DocumentStore.
     - Shared Resource: The document content and client set.
+    - Blocking I/O: This thread blocks on ws.send() and message iteration.
     """
-    num = clients.add(ws)
-    logging.info(f"Client connected. Active clients={num}")
+    client_id = str(uuid.uuid4())
+    num = clients.add(client_id, ws)
+    logging.info(f"Client {client_id} connected. Active clients={num}")
 
     try:
         # On connect, send current document
         content, version = document_store.get_document()
+        lock_holder, is_locked = document_store.get_lock_status()
         ws.send(json.dumps({
-            "type": "document",
+            "type": "init",
+            "client_id": client_id,
             "content": content,
             "version": version,
             "clients": num,
+            "lock_holder": lock_holder,
+            "is_locked": is_locked,
         }))
 
         for raw in ws:
@@ -73,24 +79,59 @@ def handle_client(ws: Any) -> None:
             mtype = message.get("type")
             if mtype == "get_document":
                 content, version = document_store.get_document()
+                lock_holder, is_locked = document_store.get_lock_status()
                 ws.send(json.dumps({
                     "type": "document",
                     "content": content,
                     "version": version,
                     "clients": len(clients.snapshot()),
+                    "lock_holder": lock_holder,
+                    "is_locked": is_locked,
                 }))
+            elif mtype == "request_lock":
+                acquired = document_store.try_acquire_editor_lock(client_id)
+                ws.send(json.dumps({
+                    "type": "lock_response",
+                    "acquired": acquired,
+                    "lock_holder": client_id if acquired else None,
+                }))
+                if acquired:
+                    broadcast(json.dumps({
+                        "type": "lock_status",
+                        "is_locked": True,
+                        "lock_holder": client_id,
+                    }), exclude=None)
+            elif mtype == "release_lock":
+                document_store.release_editor_lock(client_id)
+                ws.send(json.dumps({"type": "lock_released"}))
+                broadcast(json.dumps({
+                    "type": "lock_status",
+                    "is_locked": False,
+                    "lock_holder": None,
+                }), exclude=None)
+            elif mtype == "renew_lock":
+                renewed = document_store.renew_editor_lock(client_id)
+                ws.send(json.dumps({"type": "lock_renewed", "renewed": renewed}))
             elif mtype == "edit":
+                lock_holder, is_locked = document_store.get_lock_status()
+                if is_locked and lock_holder != client_id:
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "message": "edit_locked",
+                        "lock_holder": lock_holder,
+                    }))
+                    continue
+
                 new_content = message.get("content", "")
-                # Last-write-wins MVP
                 updated_version = document_store.update_document(new_content)
                 ws.send(json.dumps({"type": "ack", "version": updated_version}))
-
-                # Broadcast to all except sender
                 broadcast_payload = json.dumps({
                     "type": "document",
                     "content": new_content,
                     "version": updated_version,
                     "clients": len(clients.snapshot()),
+                    "lock_holder": lock_holder,
+                    "is_locked": is_locked,
                 })
                 broadcast(broadcast_payload, exclude=ws)
             else:
@@ -99,8 +140,15 @@ def handle_client(ws: Any) -> None:
     except Exception as exc:  # noqa: BLE001 broad catch for server stability with logging
         logging.exception("Unhandled error in client handler: %s", exc)
     finally:
-        num = clients.remove(ws)
-        logging.info(f"Client disconnected. Active clients={num}")
+        # Release any lock held by this client and notify others
+        document_store.release_editor_lock(client_id)
+        broadcast(json.dumps({
+            "type": "lock_status",
+            "is_locked": False,
+            "lock_holder": None,
+        }), exclude=None)
+        num = clients.remove(client_id)
+        logging.info(f"Client {client_id} disconnected. Active clients={num}")
 
 
 def process_request(path: str, request_headers: Dict[str, str]):
@@ -133,10 +181,11 @@ def process_request(path: str, request_headers: Dict[str, str]):
 
 def broadcast(message: str, exclude: Any | None = None) -> None:
     """Send a message to all connected clients except the optional exclude."""
-    targets = [c for c in clients.snapshot() if c is not exclude]
-    for c in targets:
+    snapshot = clients.snapshot()
+    targets = [ws for ws in snapshot.values() if ws is not exclude]
+    for ws in targets:
         try:
-            c.send(message)
+            ws.send(message)
         except Exception:
             pass
 
