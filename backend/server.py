@@ -7,6 +7,7 @@ import uuid
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from document_store import DocumentStore
@@ -38,6 +39,16 @@ clients = ClientRegistry()
 
 app = FastAPI()
 
+# CORS: allow frontend origins to access WebSocket upgrade and health endpoint.
+# In production, replace ["*"] with your explicit frontend origin(s).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/healthz")
 async def healthz():
@@ -56,6 +67,15 @@ async def broadcast(message: str, exclude: WebSocket | None = None) -> None:
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
+    """
+    Async WebSocket endpoint implementing collaborative editing.
+
+    OS Concepts:
+    - Shared Resource: The in-memory document content is shared by all clients.
+    - Critical Sections: All reads/writes to shared state are guarded by an asyncio.Lock in DocumentStore.
+    - Mutual Exclusion: The editor lock provides app-level exclusivity for edits.
+    - Non-blocking I/O: All network operations use await to avoid blocking the event loop.
+    """
     await ws.accept()
     client_id = str(uuid.uuid4())
     num = clients.add(client_id, ws)
