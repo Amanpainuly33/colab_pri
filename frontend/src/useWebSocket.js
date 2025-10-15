@@ -8,6 +8,7 @@ export function useWebSocket(url = DEFAULT_URL) {
   const wsRef = useRef(null)
   const [connectionStatus, setConnectionStatus] = useState('disconnected')
   const [lastMessage, setLastMessage] = useState(null)
+  const [clientId, setClientId] = useState(null)
   const reconnectRef = useRef({ attempts: 0, timer: null })
 
   const normalizeWsUrl = useCallback((input) => {
@@ -40,6 +41,9 @@ export function useWebSocket(url = DEFAULT_URL) {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
+        if (data && data.type === 'init' && data.client_id) {
+          setClientId(data.client_id)
+        }
         setLastMessage(data)
       } catch {
         // ignore malformed messages
@@ -48,6 +52,7 @@ export function useWebSocket(url = DEFAULT_URL) {
 
     ws.onclose = () => {
       setConnectionStatus('disconnected')
+      setClientId(null)
       scheduleReconnect()
     }
 
@@ -85,7 +90,7 @@ export function useWebSocket(url = DEFAULT_URL) {
     }
   }, [connect])
 
-  return { sendMessage, lastMessage, connectionStatus, reconnect: connect }
+  return { sendMessage, lastMessage, connectionStatus, reconnect: connect, clientId }
 }
 
 
