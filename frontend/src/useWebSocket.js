@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 // Use /ws path to match backend upgrade route in production
-const DEFAULT_URL =  'wss://colab-pri.onrender.com/ws'
+const DEFAULT_URL =  'https://colab-pri.onrender.com/ws'
 
 export function useWebSocket(url = DEFAULT_URL) {
   const wsRef = useRef(null)
